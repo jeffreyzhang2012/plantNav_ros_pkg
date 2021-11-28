@@ -1,0 +1,5 @@
+<launch>
+    <node name="img_publisher" pkg="plantNav" type="img_pub.py" output="screen"/>
+    <node name="joint_subscriber" pkg="plantNav" type="joint_sub.py" output="screen"/>
+    <include file="$(find dofbot_moveit)/launch/dofbot_moveit.launch"/>
+</launch>
