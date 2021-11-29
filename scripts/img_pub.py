@@ -13,6 +13,7 @@ import rospy
 from sensor_msgs.msg import JointState, Image
 from math import pi
 import numpy as np
+import matplotlib.pyplot as plt
 from sensor_msgs.msg import PointCloud
 import sensor_msgs.msg
 import sys
@@ -248,20 +249,6 @@ class particle_filter(object):
         new_and_old_points = new_and_old_points[(-new_and_old_points[:,2]).argsort()]
         self.collected_n = min(self.collected_n + newPoints.shape[0], self.n)
         self.keypoints = new_and_old_points[:self.collected_n]
-        # for point in kp:
-        #     (x,y) = point.pt
-        #     response = point.response
-        #     dist,idx = KDTree(self.keypoints[:self.collected_n,:2]).query([x,y])
-        #     if idx >= self.collected_n:
-        #         self.keypoints[self.collected_n] = np.array([x,y,response])
-        #         self.collected_n+=1
-        #     elif dist < 30:
-        #         oldPt = self.keypoints[idx]
-        #         self.keypoints[idx,:2] = oldPt[:2] + ([x,y] - oldPt[:2]) * response/oldPt[2]
-        #         self.keypoints[idx,2] += point.response
-        #     elif np.min(self.keypoints[:self.n,2]) < response:
-        #         self.keypoints[np.argmin(self.keypoints[:self.n,2])] = np.array([x,y,response])
-        # self.keypoints = self.keypoints[(-self.keypoints[:,2]).argsort()]
         display_kp = []
         self.keypoints[:,2] = self.keypoints[:,2] * 100 / np.mean(self.keypoints[:,2])
         for i in range(min(self.collected_n,self.select)):
@@ -292,6 +279,8 @@ class Detector(object):
         self.flow = None
         self.hsv = np.zeros((480,640,3),np.uint8)
         self.hsv[...,1] = 255
+        # fig = plt.figure()
+        # self.ax = fig.addsubplot(projection = 'polar')
     
     def get_img(self):
         st = time.process_time()
@@ -299,7 +288,6 @@ class Detector(object):
         self.original = cv.resize(img, (640, 480))
         self.img = cv.blur(self.original,(3,3))
         self.gray = cv.cvtColor(self.img,cv.COLOR_BGR2GRAY)
-        # return self.img
         print("Acquiring took ", time.process_time()-st)
 
     def get_masked(self):
@@ -308,7 +296,6 @@ class Detector(object):
         green = cv.inRange(hsv, self.GREEN_MIN, self.GREEN_MAX)
         self.masked = cv.bitwise_and(self.img,self.img,mask=green)
         self.masked_gray = cv.cvtColor(self.masked,cv.COLOR_BGR2GRAY)
-        # return self.masked
         print("Masking took ", time.process_time()-st)
 
 
@@ -325,6 +312,8 @@ class Detector(object):
         if self.prev_img is None: self.prev_img = self.gray
         flow = cv.calcOpticalFlowFarneback(self.prev_img,self.gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         self.mag, self.ang = cv.cartToPolar(flow[...,0], flow[...,1])
+        self.mag = cv.medianBlur(self.mag,3)
+        self.ang = cv.medianBlur(self.ang,3)
         self.hsv[...,0] = self.ang*180/np.pi/2
         self.hsv[...,2] = cv.normalize(self.mag,None,0,255,cv.NORM_MINMAX)
         bgr = cv.cvtColor(self.hsv,cv.COLOR_HSV2BGR)
@@ -332,7 +321,31 @@ class Detector(object):
         self.flow = bgr
         print("Optical Flow took ", time.process_time()-st)
         
-    # def analyzeFlow(self):
+    def analyzeFlow(self):
+        st = time.process_time()
+        # idx1d = self.mag.flatten().argsort()[-1000:]
+        mag1d = self.mag.flatten()
+        ang1d = self.ang.flatten()
+        idx1d = np.where(mag1d > 1)
+        np.random.shuffle(idx1d[0])
+        idx1d = idx1d[0][:2000]
+        idx = np.unravel_index((idx1d,), self.mag.shape)
+        print(idx,idx1d)
+        x = self.mag[idx] * np.cos(self.ang[idx])
+        y = self.mag[idx] * np.sin(self.ang[idx])
+        print("Sorting took ", time.process_time()-st)
+        plt.clf()
+        # scatter plot
+        plt.scatter(x,y,s=1)
+        wid = 50
+        plt.xlim([-wid,wid])
+        plt.ylim([-wid,wid])
+        #  histogram plot
+        # n,bins,patches = plt.hist(ang1d[idx1d],50,density=True)
+        # plt.xlim([0,2*np.pi])
+
+        plt.pause(0.01)
+        print("Analyze Flow took ", time.process_time()-st)
 
 
     def to_msg(self,img):
@@ -357,6 +370,7 @@ def publish():
             d.get_img()
             d.get_masked()
             d.get_opticalFlow()
+            d.analyzeFlow()
             st = time.process_time()
             pub_raw.publish(d.to_msg(d.img))
             pub_masked.publish(d.to_msg(d.masked))
