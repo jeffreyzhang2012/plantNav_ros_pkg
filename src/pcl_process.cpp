@@ -1,0 +1,42 @@
+#include <iostream>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include "ros/ros.h"
+
+void callback(const PointCloud::ConstPtr& msg)
+{
+  printf ("Cloud: width = %d, height = %d\n", msg->width, msg->height);
+  BOOST_FOREACH (const pcl::PointXYZ& pt, msg->points)
+    printf ("\t(%f, %f, %f)\n", pt.x, pt.y, pt.z);
+}
+
+int main ()
+{
+//   pcl::PointCloud<pcl::PointXYZ> cloud;
+
+//   // Fill in the cloud data
+//   cloud.width    = 5;
+//   cloud.height   = 1;
+//   cloud.is_dense = false;
+//   cloud.resize (cloud.width * cloud.height);
+
+//   for (auto& point: cloud)
+//   {
+//     point.x = 1024 * rand () / (RAND_MAX + 1.0f);
+//     point.y = 1024 * rand () / (RAND_MAX + 1.0f);
+//     point.z = 1024 * rand () / (RAND_MAX + 1.0f);
+//   }
+
+//   pcl::io::savePCDFileASCII ("test_pcd.pcd", cloud);
+//   std::cerr << "Saved " << cloud.size () << " data points to test_pcd.pcd." << std::endl;
+
+//   for (const auto& point: cloud)
+//     std::cerr << "    " << point.x << " " << point.y << " " << point.z << std::endl;
+  ros::init(argc, argv, "sub_pcl");
+  ros::NodeHandle nh;
+  ros::Subscriber sub = nh.subscribe<PointCloud>("raw_keypints", 1, callback);
+  while(nh.ok()){
+    ros::spin();
+  }
+  return (0);
+}

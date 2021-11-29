@@ -1,8 +1,9 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import cv2 as cv
 import threading
 import random
+import time
 from time import sleep
 # import ipywidgets as widgets
 # from IPython.display import display
@@ -12,10 +13,12 @@ import rospy
 from sensor_msgs.msg import JointState, Image
 from math import pi
 import numpy as np
-
+from sensor_msgs.msg import PointCloud
 import sensor_msgs.msg
 import sys
-
+# from pfilter import ParticleFilter, gaussian_noise, squared_error, independent_sample
+from scipy.stats import norm, gamma, uniform 
+from scipy.spatial import KDTree
 
 class CvBridgeError(TypeError):
     """
@@ -130,7 +133,7 @@ class CvBridge(object):
         else:
             if(type(img_msg.data) == str):
                 im = np.ndarray(shape=(img_msg.height, img_msg.width, n_channels),
-                               dtype=dtype, buffer=img_msg.data.encode())
+                         dtype=dtype, buffer=img_msg.data.encode())
             else:
                 im = np.ndarray(shape=(img_msg.height, img_msg.width, n_channels),
                                dtype=dtype, buffer=img_msg.data)
@@ -216,44 +219,159 @@ class CvBridge(object):
 
         return img_msg
 
+class particle_filter(object):
+    def __init__(self):
+        self.n = 400
+        self.select = 200
+        self.keypoints = np.zeros((self.n,3))
+        self.collected_n = 0
 
-RA2DE = 180 / pi
 
-def callback(msg):
-    global sbus
-    if not isinstance(msg, JointState): return
-    joints = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    for i in range(5): joints[i] = (msg.position[i] * RA2DE) + 90
-    sbus.Arm_serial_servo_write6_array(joints, 100)
+    def process(self,kp):
+        near_dist = 100
+        self.keypoints[:,2] *= 0.7
+        # print(len(kp))
+        points = np.zeros((len(kp),3))
+        for i in range(len(kp)):
+            points[i] = np.array((kp[i].pt[0],kp[i].pt[1],kp[i].response))
+        dist,idx = KDTree(self.keypoints[:,:2]).query(points[:,:2])
+        updatedPoints = points[np.where(dist<near_dist)]
+        if(updatedPoints.shape[0] != 0):
+            updatedIdx = idx[dist<near_dist]
+            updateWeights = updatedPoints[:,2]/self.keypoints[updatedIdx,2]
+            self.keypoints[updatedIdx,:2] += updateWeights[:,None] * (updatedPoints[:,:2]-self.keypoints[updatedIdx,:2])
+            self.keypoints[updatedIdx,2] += updatedPoints[:,2]
+        newPoints = points[np.where(dist>=near_dist)]
+        new_and_old_points = np.zeros((self.collected_n+newPoints.shape[0],3))
+        new_and_old_points[:self.collected_n] = self.keypoints[:self.collected_n]
+        new_and_old_points[self.collected_n:] = newPoints
+        new_and_old_points = new_and_old_points[(-new_and_old_points[:,2]).argsort()]
+        self.collected_n = min(self.collected_n + newPoints.shape[0], self.n)
+        self.keypoints = new_and_old_points[:self.collected_n]
+        # for point in kp:
+        #     (x,y) = point.pt
+        #     response = point.response
+        #     dist,idx = KDTree(self.keypoints[:self.collected_n,:2]).query([x,y])
+        #     if idx >= self.collected_n:
+        #         self.keypoints[self.collected_n] = np.array([x,y,response])
+        #         self.collected_n+=1
+        #     elif dist < 30:
+        #         oldPt = self.keypoints[idx]
+        #         self.keypoints[idx,:2] = oldPt[:2] + ([x,y] - oldPt[:2]) * response/oldPt[2]
+        #         self.keypoints[idx,2] += point.response
+        #     elif np.min(self.keypoints[:self.n,2]) < response:
+        #         self.keypoints[np.argmin(self.keypoints[:self.n,2])] = np.array([x,y,response])
+        # self.keypoints = self.keypoints[(-self.keypoints[:,2]).argsort()]
+        display_kp = []
+        self.keypoints[:,2] = self.keypoints[:,2] * 100 / np.mean(self.keypoints[:,2])
+        for i in range(min(self.collected_n,self.select)):
+            # print(self.keypoints[i,2])
+            if self.keypoints[i,2] > 50:
+                display_kp.append(cv.KeyPoint(self.keypoints[i,0],self.keypoints[i,1],self.keypoints[i,2]))
+        # print("HI")
+        return display_kp
+            
+
+
+class Detector(object):
+    def __init__(self):
+        capture = cv.VideoCapture(0)
+        capture.set(3, 640)
+        capture.set(4, 480)
+        capture.set(5, 30)  #set frame
+        self.capture = capture
+        self.fast = cv.FastFeatureDetector_create()
+        self.fast_thres = 30
+        self.fast.setThreshold(self.fast_thres)
+        self.target_n = 300
+        self.GREEN_MIN = np.array([30, 0, 0],np.uint8)
+        self.GREEN_MAX = np.array([100, 255, 255],np.uint8)
+        self.pf = particle_filter()
+        self.bridge = CvBridge()
+        self.prev_img = None
+        self.flow = None
+        self.hsv = np.zeros((480,640,3),np.uint8)
+        self.hsv[...,1] = 255
+    
+    def get_img(self):
+        st = time.process_time()
+        _, img = self.capture.read()
+        self.original = cv.resize(img, (640, 480))
+        self.img = cv.blur(self.original,(3,3))
+        self.gray = cv.cvtColor(self.img,cv.COLOR_BGR2GRAY)
+        # return self.img
+        print("Acquiring took ", time.process_time()-st)
+
+    def get_masked(self):
+        st = time.process_time()
+        hsv = cv.cvtColor(self.img,cv.COLOR_BGR2HSV)
+        green = cv.inRange(hsv, self.GREEN_MIN, self.GREEN_MAX)
+        self.masked = cv.bitwise_and(self.img,self.img,mask=green)
+        self.masked_gray = cv.cvtColor(self.masked,cv.COLOR_BGR2GRAY)
+        # return self.masked
+        print("Masking took ", time.process_time()-st)
+
+
+    def fast_detector(self):
+        kp = self.fast.detect(self.masked,None)
+        diff = len(kp) - self.target_n
+        if abs(diff) > 10:
+            self.fast_thres += np.sign(diff) * 10
+            self.fast.setThreshold(self.fast_thres)
+        kp_filtered = self.pf.process(kp)
+
+    def get_opticalFlow(self):
+        st = time.process_time()
+        if self.prev_img is None: self.prev_img = self.gray
+        flow = cv.calcOpticalFlowFarneback(self.prev_img,self.gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        self.mag, self.ang = cv.cartToPolar(flow[...,0], flow[...,1])
+        self.hsv[...,0] = self.ang*180/np.pi/2
+        self.hsv[...,2] = cv.normalize(self.mag,None,0,255,cv.NORM_MINMAX)
+        bgr = cv.cvtColor(self.hsv,cv.COLOR_HSV2BGR)
+        self.prev_img = self.gray
+        self.flow = bgr
+        print("Optical Flow took ", time.process_time()-st)
+        
+    # def analyzeFlow(self):
+
+
+    def to_msg(self,img):
+        return self.bridge.cv_to_imgmsg(np.array(img))
+
+    
+        
 
 # Arm.Arm_serial_servo_write6_array(joints, 100)
 def publish():
-    pub = rospy.Publisher("/camera/image_raw", Image, queue_size=10)
-    pub2 = rospy.Publisher("/camera/image_fast", Image, queue_size=10)
-    # Open camera
-    capture = cv.VideoCapture(0)
-    capture.set(3, 640)
-    capture.set(4, 480)
-    capture.set(5, 30)  #set frame
-    bridge = CvBridge()
+    pub_raw = rospy.Publisher("/camera/image_raw", Image, queue_size=10)
+    pub_masked = rospy.Publisher("/camera/image_masked", Image, queue_size=10)
+    pub_flow = rospy.Publisher("/camera/image_opticalFlow", Image, queue_size=10)
+    # pub2 = rospy.Publisher("/camera/image_fast_raw", Image, queue_size=10)
+    # pub3 = rospy.Publisher("/camera/image_fast_filtered", Image, queue_size=10)
+    # pub4 = rospy.Publisher("/camera/image_edges", Image, queue_size=10)
+    d = Detector()
     rospy.init_node("img_publisher", anonymous=True)
     rate = rospy.Rate(1)
-    fast = cv.FastFeatureDetector_create()
-    print(fast.getThreshold())
-    fast.setThreshold(50)
-    # Be executed in loop when the camera is opened normally
-    while capture.isOpened() and not rospy.is_shutdown():
+    while d.capture.isOpened() and not rospy.is_shutdown():
         try:
-            _, img = capture.read()
-            img = cv.resize(img, (640, 480))
-            kp = fast.detect(img,None)
-            img_fast = cv.drawKeypoints(img,kp,None, color=(255,0,0))
-            msg = bridge.cv_to_imgmsg(np.array(img))
-            msg_fast = bridge.cv_to_imgmsg(np.array(img_fast))
-            pub.publish(msg)
-            pub2.publish(msg_fast)
+            d.get_img()
+            d.get_masked()
+            d.get_opticalFlow()
+            st = time.process_time()
+            pub_raw.publish(d.to_msg(d.img))
+            pub_masked.publish(d.to_msg(d.masked))
+            pub_flow.publish(d.to_msg(d.flow))
+            print("Publishing took ", time.process_time()-st)
+            # img_fast_raw = cv.drawKeypoints(img,kp,None, color=(255,0,0))
+            # img_fast_filtered = cv.drawKeypoints(img,kp_filtered,None, color=(255,0,0))
+            # msg = bridge.cv_to_imgmsg(np.array(img))
+            # msg_fast_raw = bridge.cv_to_imgmsg(np.array(img_fast_raw))
+            # msg_fast_filtered = bridge.cv_to_imgmsg(np.array(img_fast_filtered))
+            # pub.publish(msg)
+            # pub2.publish(msg_fast_raw)
+            # pub3.publish(msg_fast_filtered)
         except KeyboardInterrupt:
-            capture.release()
+            d.capture.release()
             cv.destroyAllWindows()
             break
 
