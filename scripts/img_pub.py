@@ -235,7 +235,7 @@ class particle_filter(object):
 
     def process(self,kp):
         near_dist = 100
-        self.keypoints[:,2] *= 0.7
+        self.keypoints[:,2] *= 0.9
         # print(len(kp))
         points = np.zeros((len(kp),3))
         for i in range(len(kp)):
@@ -284,8 +284,10 @@ class Detector(object):
         self.fast = cv.FastFeatureDetector_create()
         self.fast_thres = 30
         self.fast.setThreshold(self.fast_thres)
+        self.fast_raw = np.zeros((self.h,self.w,3),np.uint8)
+        self.fast_filtered = np.zeros((self.h,self.w,3),np.uint8)
         self.target_n = 300
-        self.GREEN_MIN = np.array([30, 0, 0],np.uint8)
+        self.GREEN_MIN = np.array([30, 30, 0],np.uint8)
         self.GREEN_MAX = np.array([100, 255, 255],np.uint8)
         self.pf = particle_filter()
         self.bridge = CvBridge()
@@ -294,6 +296,7 @@ class Detector(object):
         self.hsv = np.zeros((self.h,self.w,3),np.uint8)
         self.hsv[...,1] = 255
         self.scaler = StandardScaler()
+        self.mask = None
         self.n_clusters = 20
         self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=0)
         self.labeled = np.zeros((self.h,self.w,3),np.uint8)
@@ -303,7 +306,7 @@ class Detector(object):
         self.skeleton[...,1] = 255
         self.skeleton_bgr = None
         self.final = None
-
+        self.green = None
         # fig = plt.figure()
         # self.ax = fig.addsubplot(projection = 'polar')
     
@@ -318,7 +321,10 @@ class Detector(object):
                 self.img_phone = cv.resize(img_phone, (640, 480))
             self.original = cv.resize(img, (self.w, self.h))
             self.img = cv.blur(self.original,(3,3))
-        self.gray = cv.cvtColor(self.img,cv.COLOR_BGR2GRAY)
+        self.green = np.copy(self.img)
+        self.green[:,:,0] = 0
+        self.green[:,:,2] = 0
+        self.gray = cv.cvtColor(self.green,cv.COLOR_BGR2GRAY)
         print("Acquiring took ", time.process_time()-st)
 
     def get_masked(self):
@@ -331,12 +337,21 @@ class Detector(object):
 
 
     def fast_detector(self):
-        kp = self.fast.detect(self.masked,None)
-        diff = len(kp) - self.target_n
+        # if self.masked is None: return False
+        self.kp = self.fast.detect(self.gray,None)
+        if len(self.kp) == 0: return False
+        diff = len(self.kp) - self.target_n
         if abs(diff) > 10:
             self.fast_thres += np.sign(diff) * 10
             self.fast.setThreshold(self.fast_thres)
-        kp_filtered = self.pf.process(kp)
+        self.kp_filtered = self.pf.process(self.kp)
+        return True
+
+    def get_fast(self):
+        if not self.fast_detector(): return False
+        self.fast_raw = cv.drawKeypoints(self.gray, self.kp, None, color=(255,0,0))
+        self.fast_filtered = cv.drawKeypoints(self.gray, self.kp_filtered, None, color=(255,0,0))
+        return True
 
     def get_opticalFlow(self):
         st = time.process_time()
@@ -453,13 +468,17 @@ received = 0
 
 # Arm.Arm_serial_servo_write6_array(joints, 100)
 def publish():
-    have_phone = 1
+    have_phone = 0
     use_bag = 1
+    fast_detector = 0
     d = Detector(have_phone, use_bag)
     global received
     pub_labels = rospy.Publisher("/labels", Image, queue_size=10)
     pub_skeleton = rospy.Publisher("/skeleton", Image, queue_size=10)
     pub_final = rospy.Publisher("/final", Image, queue_size=10)
+    if fast_detector:
+        pub_fast_raw = rospy.Publisher("/FAST/raw", Image, queue_size=10)
+        pub_fast_filtered = rospy.Publisher("/FAST/filtered", Image, queue_size=10)
     if use_bag:
         def callback(data):
             global received
@@ -485,25 +504,33 @@ def publish():
                 if received:
                     d.get_img()
                     d.get_masked()
-                    d.get_opticalFlow()
-                    d.analyzeFlow()
+                    if fast_detector:
+                        if d.get_fast():
+                            pub_fast_raw.publish(d.to_msg(d.fast_raw))
+                            pub_fast_filtered.publish(d.to_msg(d.fast_filtered))
+                    # d.get_opticalFlow()
+                    # d.analyzeFlow()
                     received = 0
                     if not d.labeled_bgr is None:
-                        pub_labels.publish(d.to_msg(d.labeled_bgr))
-                        pub_skeleton.publish(d.to_msg(d.skeleton_bgr))
-                        pub_final.publish(d.to_msg(d.final))
-
+                        # pub_labels.publish(d.to_msg(d.labeled_bgr))
+                        # pub_skeleton.publish(d.to_msg(d.skeleton_bgr))
+                        # pub_final.publish(d.to_msg(d.final))
+                        pass
             else:
                 d.get_img()
-                d.get_masked()
-                d.get_opticalFlow()
+                # d.get_masked()
+                if fast_detector:
+                    if d.get_fast():
+                        pub_fast_raw.publish(d.to_msg(d.fast_raw))
+                        pub_fast_filtered.publish(d.to_msg(d.fast_filtered))
+                # d.get_opticalFlow()
                 # d.analyzeFlow()
                 st = time.process_time()
                 if not use_bag:
                     pub_raw.publish(d.to_msg(d.img))
                     if have_phone: pub_phone.publish(d.to_msg(d.img_phone))
-                    pub_masked.publish(d.to_msg(d.masked))
-                    pub_flow.publish(d.to_msg(d.flow))
+                    # pub_masked.publish(d.to_msg(d.masked))
+                    # pub_flow.publish(d.to_msg(d.flow))
                 print("Publishing took ", time.process_time()-st)
         except KeyboardInterrupt:
             if not use_bag:
