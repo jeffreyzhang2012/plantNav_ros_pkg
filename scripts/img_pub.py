@@ -5,10 +5,14 @@ import threading
 import random
 import time
 from time import sleep
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 # import ipywidgets as widgets
 # from IPython.display import display
 # from color_follow import color_follow
 # import Arm_Lib
+# from cv_bridge import CvBridge, CvBridgeError
+# import ros_numpy
 import rospy
 from sensor_msgs.msg import JointState, Image
 from math import pi
@@ -125,7 +129,8 @@ class CvBridge(object):
         This function returns an OpenCV :cpp:type:`cv::Mat` message on success, or raises :exc:`cv_bridge.CvBridgeError` on failure.
         If the image only has one channel, the shape has size 2 (width and height)
         """
-        dtype, n_channels = self.encoding_to_dtype_with_channels(img_msg.encoding)
+        # dtype, n_channels = self.encoding_to_dtype_with_channels(img_msg.encoding)
+        dtype, n_channels = np.uint8, 3
         dtype = np.dtype(dtype)
         dtype = dtype.newbyteorder('>' if img_msg.is_bigendian else '<')
         if n_channels == 1:
@@ -252,21 +257,30 @@ class particle_filter(object):
         display_kp = []
         self.keypoints[:,2] = self.keypoints[:,2] * 100 / np.mean(self.keypoints[:,2])
         for i in range(min(self.collected_n,self.select)):
-            # print(self.keypoints[i,2])
             if self.keypoints[i,2] > 50:
                 display_kp.append(cv.KeyPoint(self.keypoints[i,0],self.keypoints[i,1],self.keypoints[i,2]))
-        # print("HI")
         return display_kp
             
-
-
 class Detector(object):
-    def __init__(self):
-        capture = cv.VideoCapture(0)
-        capture.set(3, 640)
-        capture.set(4, 480)
-        capture.set(5, 30)  #set frame
-        self.capture = capture
+    def __init__(self,have_phone,use_bag):
+        self.have_phone = have_phone
+        self.use_bag = use_bag
+        self.w = 320
+        self.h = 240
+        if self.use_bag:
+            pass
+        else:   
+            if have_phone:
+                phone = cv.VideoCapture(2)
+                phone.set(3, 640)
+                phone.set(4, 480)
+                phone.set(5, 30)  #set frame
+                self.phone = phone
+            capture = cv.VideoCapture(1)
+            capture.set(3, self.w)
+            capture.set(4, self.h)
+            capture.set(5, 30)  #set frame
+            self.capture = capture
         self.fast = cv.FastFeatureDetector_create()
         self.fast_thres = 30
         self.fast.setThreshold(self.fast_thres)
@@ -277,16 +291,33 @@ class Detector(object):
         self.bridge = CvBridge()
         self.prev_img = None
         self.flow = None
-        self.hsv = np.zeros((480,640,3),np.uint8)
+        self.hsv = np.zeros((self.h,self.w,3),np.uint8)
         self.hsv[...,1] = 255
+        self.scaler = StandardScaler()
+        self.n_clusters = 20
+        self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=0)
+        self.labeled = np.zeros((self.h,self.w,3),np.uint8)
+        self.labeled[...,1] = 255
+        self.labeled_bgr = None
+        self.skeleton = np.zeros((self.h,self.w,3),np.uint8)
+        self.skeleton[...,1] = 255
+        self.skeleton_bgr = None
+        self.final = None
+
         # fig = plt.figure()
         # self.ax = fig.addsubplot(projection = 'polar')
     
     def get_img(self):
         st = time.process_time()
-        _, img = self.capture.read()
-        self.original = cv.resize(img, (640, 480))
-        self.img = cv.blur(self.original,(3,3))
+        if self.use_bag:
+            pass
+        else:
+            _, img = self.capture.read()
+            if self.have_phone:
+                _, img_phone = self.phone.read()
+                self.img_phone = cv.resize(img_phone, (640, 480))
+            self.original = cv.resize(img, (self.w, self.h))
+            self.img = cv.blur(self.original,(3,3))
         self.gray = cv.cvtColor(self.img,cv.COLOR_BGR2GRAY)
         print("Acquiring took ", time.process_time()-st)
 
@@ -330,62 +361,154 @@ class Detector(object):
         np.random.shuffle(idx1d[0])
         idx1d = idx1d[0][:2000]
         idx = np.unravel_index((idx1d,), self.mag.shape)
-        print(idx,idx1d)
+        idx_X, idx_Y = np.array(idx[0]).squeeze(), np.array(idx[1]).squeeze()
+        print("Processing optical flow took ", time.process_time()-st)
         x = self.mag[idx] * np.cos(self.ang[idx])
         y = self.mag[idx] * np.sin(self.ang[idx])
-        print("Sorting took ", time.process_time()-st)
-        plt.clf()
-        # scatter plot
-        plt.scatter(x,y,s=1)
-        wid = 50
-        plt.xlim([-wid,wid])
-        plt.ylim([-wid,wid])
-        #  histogram plot
-        # n,bins,patches = plt.hist(ang1d[idx1d],50,density=True)
-        # plt.xlim([0,2*np.pi])
-
-        plt.pause(0.01)
-        print("Analyze Flow took ", time.process_time()-st)
+        # data = np.vstack((idx[1],x,y)).T
+        data = np.vstack((idx[1],self.mag[idx],self.ang[idx])).T
+        self.labeled_bgr = None
+        self.skeleton_bgr = None
+        self.labeled[...,2] = 0
+        self.skeleton[...,2] = 0
+        if data.shape[0] <= self.n_clusters: return
+        data_scaled = self.scaler.fit_transform(data)
+        # print(data_scaled.shape)
+        data_scaled[:,2] *= 3
+        kmeans_data = self.kmeans.fit(data_scaled)
+        clustere_after_combine = np.arange(self.n_clusters)
+        # recombine cluster centers
+        for i in range(self.n_clusters):
+            ci = kmeans_data.cluster_centers_[i]
+            for j in range(i+1,self.n_clusters):
+                cj = kmeans_data.cluster_centers_[j]     
+                diff = ci - cj
+                diff[2] = (diff[2] + np.pi) % (2*np.pi) - np.pi        
+                d = np.linalg.norm(ci-cj)
+                if d < 1:
+                    kmeans_data.labels_ = np.where(kmeans_data.labels_ == j, clustere_after_combine[i], kmeans_data.labels_)
+                    clustere_after_combine[j] = clustere_after_combine[i]
+        actual_n_clusters = np.unique(clustere_after_combine)
+        for i in actual_n_clusters:
+            cluster_idx = np.where(kmeans_data.labels_ == i)[0]
+            cluster_x = np.array(idx_X[cluster_idx])
+            cluster_y = np.array(idx_Y[cluster_idx])
+            sort_idx = cluster_x.argsort()
+            cluster_x = np.array(cluster_x[sort_idx])
+            cluster_y = np.array(cluster_y[sort_idx])
+            num_pt_skeleton = (cluster_x[-1] - cluster_x[0])//10
+            n_per_skeleton = len(sort_idx)//num_pt_skeleton
+            pix = np.zeros((1,1,3),np.uint8)
+            pix[0,0,:] = [(i*100 + 33) % 255,255,255]
+            color = cv.cvtColor(pix,cv.COLOR_HSV2BGR)[0,0,:]
+            color = (int(color[0]),int(color[1]),int(color[2]))
+            points = []       
+            if n_per_skeleton <= 10: continue
+            for j in range(num_pt_skeleton):
+                cx,cy = int(np.mean(cluster_x[j*n_per_skeleton:(j+1)*n_per_skeleton])), int(np.mean(cluster_y[j*n_per_skeleton:(j+1)*n_per_skeleton]))
+                self.skeleton[cx,cy,0] = (i*100 + 33) % 255
+                self.skeleton[cx,cy,2] = 255
+                points.append([cy,cx])
+            points = np.array(points,np.int32).reshape((-1,1,2))
+            self.final = cv.polylines(self.img, [points], False, color, 2)
+        self.labeled[idx[0],idx[1],0] = (kmeans_data.labels_*100 + 33) % 255
+        self.labeled[idx[0],idx[1],2] = 255
+        self.labeled_bgr = cv.cvtColor(self.labeled,cv.COLOR_HSV2BGR)
+        self.skeleton_bgr = cv.cvtColor(self.skeleton,cv.COLOR_HSV2BGR)
+        st = time.process_time()
+        plot = 0
+        if plot != 0:
+            plt.clf()
+            # scatter plot
+            if plot == 1:
+                plt.scatter(x,y,s=1)
+                wid = 50
+                plt.xlim([-wid,wid])
+                plt.ylim([-wid,wid])
+                plt.xlabel("delta X, pixels")
+                plt.ylabel("delta Y, pixels")
+                plt.title("Movement of Feature Points")
+            #  histogram plot
+            else:
+                n,bins,patches = plt.hist(ang1d[idx1d],100,density=True)
+                plt.xlim([0,2*np.pi])
+                plt.xlabel("Angles, rad")
+                plt.ylabel("Count")
+                plt.title("Feature Points Angles")
+            plt.pause(0.01)
+        print("Plotting took ", time.process_time()-st)
 
 
     def to_msg(self,img):
         return self.bridge.cv_to_imgmsg(np.array(img))
 
+    def ok(self):
+        if self.use_bag: return True
+        if self.have_phone:
+            return self.capture.isOpened() and self.phone.isOpened()
+        return self.capture.isOpened()
+
     
-        
+received = 0
 
 # Arm.Arm_serial_servo_write6_array(joints, 100)
 def publish():
-    pub_raw = rospy.Publisher("/camera/image_raw", Image, queue_size=10)
-    pub_masked = rospy.Publisher("/camera/image_masked", Image, queue_size=10)
-    pub_flow = rospy.Publisher("/camera/image_opticalFlow", Image, queue_size=10)
-    # pub2 = rospy.Publisher("/camera/image_fast_raw", Image, queue_size=10)
-    # pub3 = rospy.Publisher("/camera/image_fast_filtered", Image, queue_size=10)
-    # pub4 = rospy.Publisher("/camera/image_edges", Image, queue_size=10)
-    d = Detector()
+    have_phone = 1
+    use_bag = 1
+    d = Detector(have_phone, use_bag)
+    global received
+    pub_labels = rospy.Publisher("/labels", Image, queue_size=10)
+    pub_skeleton = rospy.Publisher("/skeleton", Image, queue_size=10)
+    pub_final = rospy.Publisher("/final", Image, queue_size=10)
+    if use_bag:
+        def callback(data):
+            global received
+            try:
+                # d.img = ros_numpy.numpify(data)
+                d.img = d.bridge.imgmsg_to_cv(data)
+                received = 1
+            except CvBridgeError as e:
+                print(e)
+
+        sub_img = rospy.Subscriber("/camera/image_raw", Image, callback)
+    else:
+        pub_raw = rospy.Publisher("/camera/image_raw", Image, queue_size=10)
+        pub_masked = rospy.Publisher("/camera/image_masked", Image, queue_size=10)
+        pub_flow = rospy.Publisher("/camera/image_opticalFlow", Image, queue_size=10)
+        pub_phone = rospy.Publisher("/phone/image_raw", Image, queue_size=10)
     rospy.init_node("img_publisher", anonymous=True)
     rate = rospy.Rate(1)
-    while d.capture.isOpened() and not rospy.is_shutdown():
+    print("ready to receive images")
+    while d.ok() and not rospy.is_shutdown():
         try:
-            d.get_img()
-            d.get_masked()
-            d.get_opticalFlow()
-            d.analyzeFlow()
-            st = time.process_time()
-            pub_raw.publish(d.to_msg(d.img))
-            pub_masked.publish(d.to_msg(d.masked))
-            pub_flow.publish(d.to_msg(d.flow))
-            print("Publishing took ", time.process_time()-st)
-            # img_fast_raw = cv.drawKeypoints(img,kp,None, color=(255,0,0))
-            # img_fast_filtered = cv.drawKeypoints(img,kp_filtered,None, color=(255,0,0))
-            # msg = bridge.cv_to_imgmsg(np.array(img))
-            # msg_fast_raw = bridge.cv_to_imgmsg(np.array(img_fast_raw))
-            # msg_fast_filtered = bridge.cv_to_imgmsg(np.array(img_fast_filtered))
-            # pub.publish(msg)
-            # pub2.publish(msg_fast_raw)
-            # pub3.publish(msg_fast_filtered)
+            if use_bag:
+                if received:
+                    d.get_img()
+                    d.get_masked()
+                    d.get_opticalFlow()
+                    d.analyzeFlow()
+                    received = 0
+                    if not d.labeled_bgr is None:
+                        pub_labels.publish(d.to_msg(d.labeled_bgr))
+                        pub_skeleton.publish(d.to_msg(d.skeleton_bgr))
+                        pub_final.publish(d.to_msg(d.final))
+
+            else:
+                d.get_img()
+                d.get_masked()
+                d.get_opticalFlow()
+                # d.analyzeFlow()
+                st = time.process_time()
+                if not use_bag:
+                    pub_raw.publish(d.to_msg(d.img))
+                    if have_phone: pub_phone.publish(d.to_msg(d.img_phone))
+                    pub_masked.publish(d.to_msg(d.masked))
+                    pub_flow.publish(d.to_msg(d.flow))
+                print("Publishing took ", time.process_time()-st)
         except KeyboardInterrupt:
-            d.capture.release()
+            if not use_bag:
+                d.capture.release()
+                if have_phone: d.phone.release()
             cv.destroyAllWindows()
             break
 
