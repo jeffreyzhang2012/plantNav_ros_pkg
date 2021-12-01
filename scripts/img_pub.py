@@ -6,6 +6,7 @@ import random
 import time
 from time import sleep
 from sklearn.cluster import KMeans
+# from scipy.cluster.vq import kmeans2
 from sklearn.preprocessing import StandardScaler
 # import ipywidgets as widgets
 # from IPython.display import display
@@ -297,8 +298,9 @@ class Detector(object):
         self.hsv[...,1] = 255
         self.scaler = StandardScaler()
         self.mask = None
-        self.n_clusters = 20
-        self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=0)
+        self.n_clusters = 8
+        self.kmeans = KMeans(n_clusters=self.n_clusters, init = 'k-means++', random_state=0)
+        # self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=0)
         self.labeled = np.zeros((self.h,self.w,3),np.uint8)
         self.labeled[...,1] = 255
         self.labeled_bgr = None
@@ -307,6 +309,7 @@ class Detector(object):
         self.skeleton_bgr = None
         self.final = None
         self.green = None
+        self.clusters = None
         # fig = plt.figure()
         # self.ax = fig.addsubplot(projection = 'polar')
     
@@ -325,7 +328,7 @@ class Detector(object):
         self.green[:,:,0] = 0
         self.green[:,:,2] = 0
         self.gray = cv.cvtColor(self.green,cv.COLOR_BGR2GRAY)
-        print("Acquiring took ", time.process_time()-st)
+        # print("Acquiring took ", time.process_time()-st)
 
     def get_masked(self):
         st = time.process_time()
@@ -333,7 +336,7 @@ class Detector(object):
         green = cv.inRange(hsv, self.GREEN_MIN, self.GREEN_MAX)
         self.masked = cv.bitwise_and(self.img,self.img,mask=green)
         self.masked_gray = cv.cvtColor(self.masked,cv.COLOR_BGR2GRAY)
-        print("Masking took ", time.process_time()-st)
+        # print("Masking took ", time.process_time()-st)
 
 
     def fast_detector(self):
@@ -365,11 +368,18 @@ class Detector(object):
         bgr = cv.cvtColor(self.hsv,cv.COLOR_HSV2BGR)
         self.prev_img = self.gray
         self.flow = bgr
-        print("Optical Flow took ", time.process_time()-st)
+        # print("Optical Flow took ", time.process_time()-st)
         
+    def cluster_diff(self,ci,cj):
+        diff = ci - cj
+        diff[2] = (diff[2] + np.pi) % (2*np.pi) - np.pi        
+        return np.linalg.norm(ci-cj)
+
+    def cluster_diff_xy(self,ci,cj):    
+        return abs(ci[0]-cj[0])
+
     def analyzeFlow(self):
         st = time.process_time()
-        # idx1d = self.mag.flatten().argsort()[-1000:]
         mag1d = self.mag.flatten()
         ang1d = self.ang.flatten()
         idx1d = np.where(mag1d > 1)
@@ -377,10 +387,9 @@ class Detector(object):
         idx1d = idx1d[0][:2000]
         idx = np.unravel_index((idx1d,), self.mag.shape)
         idx_X, idx_Y = np.array(idx[0]).squeeze(), np.array(idx[1]).squeeze()
-        print("Processing optical flow took ", time.process_time()-st)
+        # print("Processing optical flow took ", time.process_time()-st)
         x = self.mag[idx] * np.cos(self.ang[idx])
         y = self.mag[idx] * np.sin(self.ang[idx])
-        # data = np.vstack((idx[1],x,y)).T
         data = np.vstack((idx[1],self.mag[idx],self.ang[idx])).T
         self.labeled_bgr = None
         self.skeleton_bgr = None
@@ -388,22 +397,56 @@ class Detector(object):
         self.skeleton[...,2] = 0
         if data.shape[0] <= self.n_clusters: return
         data_scaled = self.scaler.fit_transform(data)
-        # print(data_scaled.shape)
         data_scaled[:,2] *= 3
         kmeans_data = self.kmeans.fit(data_scaled)
         clustere_after_combine = np.arange(self.n_clusters)
         # recombine cluster centers
+        new_clusters = []
         for i in range(self.n_clusters):
-            ci = kmeans_data.cluster_centers_[i]
+            ci = kmeans_data.cluster_centers_[i]  
             for j in range(i+1,self.n_clusters):
                 cj = kmeans_data.cluster_centers_[j]     
-                diff = ci - cj
-                diff[2] = (diff[2] + np.pi) % (2*np.pi) - np.pi        
-                d = np.linalg.norm(ci-cj)
+                d = self.cluster_diff(ci,cj)
                 if d < 1:
                     kmeans_data.labels_ = np.where(kmeans_data.labels_ == j, clustere_after_combine[i], kmeans_data.labels_)
                     clustere_after_combine[j] = clustere_after_combine[i]
         actual_n_clusters = np.unique(clustere_after_combine)
+        for i in actual_n_clusters:
+            new_clusters.append(kmeans_data.cluster_centers_[i])
+        new_clusters = np.array(new_clusters)
+        label_to_color = {}
+        for i in range(self.n_clusters):
+            label_to_color[i] = i
+        if not (self.clusters is None):
+            for i in range(len(new_clusters)):
+                min_d = 10000000
+                min_j = -1
+                i_label = actual_n_clusters[i]
+                i_color = label_to_color[i_label]
+                for j in range(len(self.clusters)):
+                    d = self.cluster_diff_xy(new_clusters[i],self.clusters[j])
+                    if d < min_d:
+                        min_d = d
+                        min_j = j
+                if min_j == -1: continue
+                minj_label = self.prev_label[min_j]
+                minj_color = self.prev_color[minj_label]
+                swapped = False
+                have_duplicate_color = False
+                for k in range(len(new_clusters)):
+                    k_label = actual_n_clusters[k]
+                    k_color = label_to_color[k_label]
+                    if k_color == minj_color:
+                        have_duplicate_color = True
+                        if self.cluster_diff_xy(self.clusters[min_j],new_clusters[k]) > min_d:
+                            label_to_color[i_label], label_to_color[k_label] = k_color, i_color
+                            swapped = True
+                        if swapped: break
+                if (not have_duplicate_color) and (not swapped):
+                    label_to_color[i_label] = minj_color
+        self.clusters = new_clusters
+        self.prev_label = actual_n_clusters
+        self.prev_color = label_to_color
         for i in actual_n_clusters:
             cluster_idx = np.where(kmeans_data.labels_ == i)[0]
             cluster_x = np.array(idx_X[cluster_idx])
@@ -412,21 +455,23 @@ class Detector(object):
             cluster_x = np.array(cluster_x[sort_idx])
             cluster_y = np.array(cluster_y[sort_idx])
             num_pt_skeleton = (cluster_x[-1] - cluster_x[0])//10
+            if num_pt_skeleton == 0: continue
             n_per_skeleton = len(sort_idx)//num_pt_skeleton
             pix = np.zeros((1,1,3),np.uint8)
-            pix[0,0,:] = [(i*100 + 33) % 255,255,255]
+            pix[0,0,:] = [(label_to_color[i]*47 + 333) % 255,255,255]
             color = cv.cvtColor(pix,cv.COLOR_HSV2BGR)[0,0,:]
             color = (int(color[0]),int(color[1]),int(color[2]))
             points = []       
             if n_per_skeleton <= 10: continue
             for j in range(num_pt_skeleton):
                 cx,cy = int(np.mean(cluster_x[j*n_per_skeleton:(j+1)*n_per_skeleton])), int(np.mean(cluster_y[j*n_per_skeleton:(j+1)*n_per_skeleton]))
-                self.skeleton[cx,cy,0] = (i*100 + 33) % 255
+                self.skeleton[cx,cy,0] = (i*47 + 333) % 255
                 self.skeleton[cx,cy,2] = 255
                 points.append([cy,cx])
             points = np.array(points,np.int32).reshape((-1,1,2))
             self.final = cv.polylines(self.img, [points], False, color, 2)
-        self.labeled[idx[0],idx[1],0] = (kmeans_data.labels_*100 + 33) % 255
+        kmeans_data.labels_ = np.vectorize(label_to_color.get)(kmeans_data.labels_)
+        self.labeled[idx[0],idx[1],0] = (kmeans_data.labels_*47 + 333) % 255
         self.labeled[idx[0],idx[1],2] = 255
         self.labeled_bgr = cv.cvtColor(self.labeled,cv.COLOR_HSV2BGR)
         self.skeleton_bgr = cv.cvtColor(self.skeleton,cv.COLOR_HSV2BGR)
@@ -451,7 +496,7 @@ class Detector(object):
                 plt.ylabel("Count")
                 plt.title("Feature Points Angles")
             plt.pause(0.01)
-        print("Plotting took ", time.process_time()-st)
+        # print("Plotting took ", time.process_time()-st)
 
 
     def to_msg(self,img):
@@ -466,7 +511,6 @@ class Detector(object):
     
 received = 0
 
-# Arm.Arm_serial_servo_write6_array(joints, 100)
 def publish():
     have_phone = 0
     use_bag = 1
@@ -483,7 +527,6 @@ def publish():
         def callback(data):
             global received
             try:
-                # d.img = ros_numpy.numpify(data)
                 d.img = d.bridge.imgmsg_to_cv(data)
                 received = 1
             except CvBridgeError as e:
@@ -497,7 +540,7 @@ def publish():
         pub_phone = rospy.Publisher("/phone/image_raw", Image, queue_size=10)
     rospy.init_node("img_publisher", anonymous=True)
     rate = rospy.Rate(1)
-    print("ready to receive images")
+    # print("ready to receive images")
     while d.ok() and not rospy.is_shutdown():
         try:
             if use_bag:
@@ -508,13 +551,13 @@ def publish():
                         if d.get_fast():
                             pub_fast_raw.publish(d.to_msg(d.fast_raw))
                             pub_fast_filtered.publish(d.to_msg(d.fast_filtered))
-                    # d.get_opticalFlow()
-                    # d.analyzeFlow()
+                    d.get_opticalFlow()
+                    d.analyzeFlow()
                     received = 0
                     if not d.labeled_bgr is None:
-                        # pub_labels.publish(d.to_msg(d.labeled_bgr))
-                        # pub_skeleton.publish(d.to_msg(d.skeleton_bgr))
-                        # pub_final.publish(d.to_msg(d.final))
+                        pub_labels.publish(d.to_msg(d.labeled_bgr))
+                        pub_skeleton.publish(d.to_msg(d.skeleton_bgr))
+                        pub_final.publish(d.to_msg(d.final))
                         pass
             else:
                 d.get_img()
@@ -523,15 +566,15 @@ def publish():
                     if d.get_fast():
                         pub_fast_raw.publish(d.to_msg(d.fast_raw))
                         pub_fast_filtered.publish(d.to_msg(d.fast_filtered))
-                # d.get_opticalFlow()
-                # d.analyzeFlow()
+                d.get_opticalFlow()
+                d.analyzeFlow()
                 st = time.process_time()
                 if not use_bag:
                     pub_raw.publish(d.to_msg(d.img))
                     if have_phone: pub_phone.publish(d.to_msg(d.img_phone))
-                    # pub_masked.publish(d.to_msg(d.masked))
-                    # pub_flow.publish(d.to_msg(d.flow))
-                print("Publishing took ", time.process_time()-st)
+                    pub_masked.publish(d.to_msg(d.masked))
+                    pub_flow.publish(d.to_msg(d.flow))
+                # print("Publishing took ", time.process_time()-st)
         except KeyboardInterrupt:
             if not use_bag:
                 d.capture.release()
